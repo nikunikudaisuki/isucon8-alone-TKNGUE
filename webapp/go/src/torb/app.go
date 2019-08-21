@@ -209,7 +209,7 @@ func getEvents(all bool) ([]*Event, error) {
 		events = append(events, &event)
 	}
 	for i, v := range events {
-		event, err := getEvent(v.ID, -1)
+		event, err := getEventWithoutDetail(v.ID, -1)
 		if err != nil {
 			return nil, err
 		}
@@ -221,19 +221,41 @@ func getEvents(all bool) ([]*Event, error) {
 	return events, nil
 }
 
-func getEvent(eventID, loginUserID int64) (*Event, error) {
+func getEventWithoutDetail(eventID, loginUserID int64) (*Event, error) {
 	var event Event
 	if err := db.QueryRow("SELECT * FROM events WHERE id = ?", eventID).Scan(&event.ID, &event.Title, &event.PublicFg, &event.ClosedFg, &event.Price); err != nil {
 		return nil, err
 	}
+
+	event.Remains = 1000
+	event.Total = 1000
 	event.Sheets = map[string]*Sheets{
-		"S": &Sheets{},
-		"A": &Sheets{},
-		"B": &Sheets{},
-		"C": &Sheets{},
+		"S": &Sheets{Total: 50, Remains: 50, Price: event.Price + 5000},
+		"A": &Sheets{Total: 150, Remains: 150, Price: event.Price + 3000},
+		"B": &Sheets{Total: 300, Remains: 300, Price: event.Price + 1000},
+		"C": &Sheets{Total: 500, Remains: 500, Price: event.Price},
+	}
+	for idx := range event.Sheets {
+		event.Sheets[idx].Detail = make([]*Sheet, event.Sheets[idx].Total)
+		for i := range event.Sheets[idx].Detail {
+			sheet := &Sheet{ID: int64(i + 1), Num: int64(i + 1), Reserved: false, Price: event.Sheets[idx].Price}
+			event.Sheets[idx].Detail[i] = sheet
+		}
 	}
 
-	rows, err := db.Query("SELECT * FROM sheets ORDER BY `rank`, num")
+	query := `
+	SELECT 
+		rank
+		, count(1) AS n_used			
+	FROM reservations
+	JOIN sheets ON sheet_id = sheets.id 
+	WHERE 
+		1 = 1
+		AND canceled_at IS NULL
+		AND event_id = ?
+	GROUP BY event_id, rank 
+	`
+	rows, err := db.Query(query, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -241,15 +263,50 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 
 	for rows.Next() {
 		var sheet Sheet
-		if err := rows.Scan(&sheet.ID, &sheet.Rank, &sheet.Num, &sheet.Price); err != nil {
+		if err := rows.Scan(&sheet.Rank, &sheet.Num); err != nil {
 			return nil, err
 		}
-		event.Sheets[sheet.Rank].Price = event.Price + sheet.Price
-		event.Total++
-		event.Sheets[sheet.Rank].Total++
+		event.Sheets[sheet.Rank].Remains -= int(sheet.Num)
+		event.Remains -= int(sheet.Num)
+	}
+	return &event, nil
+}
 
+func getEvent(eventID, loginUserID int64) (*Event, error) {
+	event, err := getEventWithoutDetail(eventID, loginUserID)
+	if err != nil {
+		return nil, err
+	}
+
+	query := `
+		SELECT 
+		  reservations.id
+		  , sheet_id
+		  , rank
+		  , num
+		  , user_id
+		  , reserved_at
+		FROM reservations 
+		JOIN sheets on sheets.id = sheet_id 
+		WHERE 
+			event_id = ?
+			AND canceled_at IS NULL 
+		GROUP BY event_id, sheet_id 
+		HAVING reserved_at = MIN(reserved_at)
+	`
+	rows, err := db.Query(query, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var sheet Sheet
 		var reservation Reservation
-		err := db.QueryRow("SELECT * FROM reservations WHERE event_id = ? AND sheet_id = ? AND canceled_at IS NULL GROUP BY event_id, sheet_id HAVING reserved_at = MIN(reserved_at)", event.ID, sheet.ID).Scan(&reservation.ID, &reservation.EventID, &reservation.SheetID, &reservation.UserID, &reservation.ReservedAt, &reservation.CanceledAt)
+		if err := rows.Scan(&reservation.ID, &sheet.ID, &sheet.Rank, &sheet.Num, &reservation.UserID, &reservation.ReservedAt); err != nil {
+			return nil, err
+		}
+
 		if err == nil {
 			sheet.Mine = reservation.UserID == loginUserID
 			sheet.Reserved = true
@@ -260,11 +317,10 @@ func getEvent(eventID, loginUserID int64) (*Event, error) {
 		} else {
 			return nil, err
 		}
-
-		event.Sheets[sheet.Rank].Detail = append(event.Sheets[sheet.Rank].Detail, &sheet)
+		event.Sheets[sheet.Rank].Detail[sheet.Num-1] = &sheet
 	}
 
-	return &event, nil
+	return event, nil
 }
 
 func sanitizeEvent(e *Event) *Event {
@@ -469,7 +525,7 @@ func main() {
 			if err := rows.Scan(&eventID); err != nil {
 				return err
 			}
-			event, err := getEvent(eventID, -1)
+			event, err := getEventWithoutDetail(eventID, -1)
 			if err != nil {
 				return err
 			}
